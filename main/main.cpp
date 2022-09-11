@@ -4,6 +4,21 @@
 #include "esp_timer.h"
 #include "i2c_conf.h"
 #include "lis3dh.h"
+#include <string.h>
+#include <sys/param.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "esp_system.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "esp_netif.h"
+#include "protocol_examples_common.h"
+#include "addr_from_stdin.h"
+#include "lwip/err.h"
+#include "lwip/sockets.h"
 
 #define CONVERT_G_TO_MS2        9.80665f
 #define INFERENCE_SAMPLING_TIME 500 // > 25ms (min inference time) 
@@ -22,6 +37,11 @@
 
 #define VIBRATOR_PIN    GPIO_NUM_26
 #define BUTTON_PIN      GPIO_NUM_0       
+
+#define HOST_IP_ADDR CONFIG_EXAMPLE_IPV4_ADDR
+#define PORT CONFIG_EXAMPLE_PORT
+
+static const char *TAG = "example";
 
 typedef enum {
     IMU_STOPPED,
@@ -112,12 +132,12 @@ static void alert_callback(void* arg)
         printf("seizure_detected\n");
         if (seizure_detected_state == false) {
             gpio_set_level(VIBRATOR_PIN, 1);
-            buzzer_start();
+            // buzzer_start();
             seizure_detected_state = true;
         }
         else {
             gpio_set_level(VIBRATOR_PIN, 0);
-            buzzer_stop();
+            // buzzer_stop();
             seizure_detected_state = false;
         }
 
@@ -131,15 +151,16 @@ static void alert_callback(void* arg)
             seizure_validated = true;
             send_alert_wifi = true;
             seizure_detected = false;
+            seizure_validation_counter = 0;
         }
     } else if (seizure_validated == true) {
         printf("seizure_validated\n");
         if (seizure_validated_state == false)
         {
-            buzzer_start();
+            // buzzer_start();
             seizure_validated_state = true;
         } else {
-            buzzer_stop();
+            // buzzer_stop();
             seizure_validated_state = false;
         }
     }
@@ -268,6 +289,23 @@ extern "C" int app_main()
     gpio_init();
     buzzer_init();
 
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    ESP_ERROR_CHECK(example_connect());
+
+    char rx_buffer[128];
+    char host_ip[] = HOST_IP_ADDR;
+    int addr_family = 0;
+    int ip_protocol = 0;
+
+    struct sockaddr_in dest_addr;
+    dest_addr.sin_addr.s_addr = inet_addr(host_ip);
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(PORT);
+    addr_family = AF_INET;
+    ip_protocol = IPPROTO_IP;
+
     /* Setup the inertial sensor */
     if (inertial_init() == false) {
         printf("Inertial sensor initialization failed\r\n");
@@ -314,7 +352,7 @@ extern "C" int app_main()
         if (gpio_get_level(BUTTON_PIN) == 0 && (seizure_detected == true || seizure_validated == true))
         {
             gpio_set_level(VIBRATOR_PIN, 0);
-            buzzer_stop();
+            // buzzer_stop();
 
             seizure_detected = false;
             seizure_detected_state = false;
@@ -330,6 +368,30 @@ extern "C" int app_main()
         {
             send_alert_wifi = false;
             printf("Envio Alerta!\n");
+
+            int sock =  socket(addr_family, SOCK_STREAM, ip_protocol);
+            if (sock < 0) {
+                printf("Unable to create socket: errno %d", errno);
+                // break;
+            }
+            printf("Socket created, connecting to %s:%d", host_ip, PORT);
+
+            int err = connect(sock, (struct sockaddr *)&dest_addr, sizeof(struct sockaddr_in6));
+            if (err != 0) {
+                printf("Socket unable to connect: errno %d", errno);
+                // break;
+            }
+            printf("Successfully connected");   
+
+            char arr[1] = {1};
+            const char* payload = reinterpret_cast<char*>(arr);
+
+            err = send(sock, payload, 1, 0);
+            if (err < 0) {
+                printf("Error occurred during sending: errno %d", errno);
+                // break;
+            } 
+            printf("leave send_alert_wifi\n");           
         }
     }
 
