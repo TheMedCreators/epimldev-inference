@@ -1,11 +1,27 @@
 #include "ei_run_classifier.h"
-#include "driver/gpio.h"
+#include <driver/gpio.h>
+#include <driver/ledc.h>
 #include "esp_timer.h"
 #include "i2c_conf.h"
 #include "lis3dh.h"
 
 #define CONVERT_G_TO_MS2        9.80665f
 #define INFERENCE_SAMPLING_TIME 500 // > 25ms (min inference time) 
+#define ALERT_INTERVAL          500
+#define SEIZURE_THRESHOLD       0.9
+#define MAX_SEIZURE_VALID_TIME  (8)
+
+#define LEDC_TIMER              LEDC_TIMER_0
+#define LEDC_MODE               LEDC_LOW_SPEED_MODE
+#define LEDC_CHANNEL            LEDC_CHANNEL_0
+#define LEDC_DUTY_RES           LEDC_TIMER_13_BIT // Set duty resolution to 13 bits
+#define LEDC_DUTY               (4095) // Set duty to 50%. ((2 ** 13) - 1) * 50% = 4095
+
+#define BUZZER_PIN              (25) // Define the output GPIO
+#define BUZZER_FREQUENCY        (4000) // Frequency in Hertz. Set frequency at 4 kHz
+
+#define VIBRATOR_PIN    GPIO_NUM_26
+#define BUTTON_PIN      GPIO_NUM_0       
 
 typedef enum {
     IMU_STOPPED,
@@ -15,6 +31,7 @@ typedef enum {
 } inference_state_t;
 
 esp_timer_handle_t imu_timer;
+esp_timer_handle_t alert_timer;
 
 static inference_state_t state = IMU_STOPPED;
 static uint64_t last_inference_ts = 0;
@@ -22,6 +39,14 @@ static bool debug_mode = false;
 static float samples_circ_buff[EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE];
 static int samples_wr_index = 0;
 static int last_samples_wr_index = 0;
+
+static bool seizure_detected = false;
+static bool seizure_detected_state = false;
+
+static bool send_alert_wifi = false;
+static bool seizure_validated = false;
+static bool seizure_validated_state = false;
+static int seizure_validation_counter = 0;
 
 static float imu_data[EI_CLASSIFIER_RAW_SAMPLES_PER_FRAME];
 LIS3DH lis3dh;
@@ -70,12 +95,78 @@ static void periodic_timer_callback(void* arg)
     }
 }
 
+void buzzer_stop(){
+    ESP_ERROR_CHECK(ledc_stop(LEDC_MODE, LEDC_CHANNEL, 0));
+}
+
+void buzzer_start(){
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, LEDC_DUTY));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
+}
+
+
+static void alert_callback(void* arg)
+{
+    if(seizure_detected == true)
+    {
+        printf("seizure_detected\n");
+        if (seizure_detected_state == false) {
+            gpio_set_level(VIBRATOR_PIN, 1);
+            buzzer_start();
+            seizure_detected_state = true;
+        }
+        else {
+            gpio_set_level(VIBRATOR_PIN, 0);
+            buzzer_stop();
+            seizure_detected_state = false;
+        }
+
+        seizure_validation_counter++;
+        
+        if (seizure_validation_counter == MAX_SEIZURE_VALID_TIME)
+        {
+            state = IMU_SAMPLING;
+            samples_wr_index = 0;
+            last_samples_wr_index = 0;
+            seizure_validated = true;
+            send_alert_wifi = true;
+            seizure_detected = false;
+        }
+    } else if (seizure_validated == true) {
+        printf("seizure_validated\n");
+        if (seizure_validated_state == false)
+        {
+            buzzer_start();
+            seizure_validated_state = true;
+        } else {
+            buzzer_stop();
+            seizure_validated_state = false;
+        }
+    }
+}
+
+void create_timer_alert(void)
+{
+    const esp_timer_create_args_t periodic_alert_args = {
+        .callback = &alert_callback,
+        .name = "Alert"
+    };
+
+    ESP_ERROR_CHECK(esp_timer_create(&periodic_alert_args, &alert_timer));    
+    ESP_ERROR_CHECK(esp_timer_start_periodic(alert_timer, ALERT_INTERVAL * 1000));
+}
+
 static void display_results(ei_impulse_result_t* result)
 {
-    ei_printf("\nPredictions (DSP: %d ms., Classification: %d ms., Anomaly: %d ms.): \n",
-        result->timing.dsp, result->timing.classification, result->timing.anomaly);
-    for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {            
-        ei_printf("    %s: \t%f\r\n", result->classification[ix].label, result->classification[ix].value);
+    // ei_printf("\nPredictions (DSP: %d ms., Classification: %d ms., Anomaly: %d ms.): \n",
+        // result->timing.dsp, result->timing.classification, result->timing.anomaly);
+    for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {          
+        if (strcmp(result->classification[ix].label, "seizure") == 0) {
+            ei_printf("    %s: \t%f\r\n", result->classification[ix].label, result->classification[ix].value);
+            if (result->classification[ix].value >= SEIZURE_THRESHOLD) {
+                seizure_detected = true;
+            }
+        } 
     }
 #if EI_CLASSIFIER_HAS_ANOMALY == 1
     ei_printf("    anomaly score: %f\r\n", result->anomaly);
@@ -129,13 +220,53 @@ void stop_imu_sampling(void)
     ESP_ERROR_CHECK(esp_timer_delete(imu_timer));
 }
 
+void gpio_init()
+{
+    gpio_pad_select_gpio(BUTTON_PIN);
+    gpio_set_direction(BUTTON_PIN, GPIO_MODE_INPUT);
+
+    gpio_pad_select_gpio(VIBRATOR_PIN);
+    gpio_set_direction(VIBRATOR_PIN, GPIO_MODE_OUTPUT);
+}
+
+static void buzzer_init()
+{
+    // Prepare and then apply the LEDC PWM timer configuration
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode       = LEDC_MODE,
+        .duty_resolution  = LEDC_DUTY_RES,
+        .timer_num        = LEDC_TIMER,
+        .freq_hz          = BUZZER_FREQUENCY,  // Set output frequency
+        .clk_cfg          = LEDC_AUTO_CLK
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+
+    // Prepare and then apply the LEDC PWM channel configuration
+    ledc_channel_config_t ledc_channel = {
+        .gpio_num       = BUZZER_PIN,
+        .speed_mode     = LEDC_MODE,
+        .channel        = LEDC_CHANNEL,
+        .intr_type      = LEDC_INTR_DISABLE,
+        .timer_sel      = LEDC_TIMER,
+        .duty           = 0, // Set duty to 0%
+        .hpoint         = 0,
+        .flags = {
+            .output_invert = 0
+        }
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
+}
+
 extern "C" int app_main()
 {
     /* Disable Leds */
-    gpio_pad_select_gpio(GPIO_NUM_4);
-    gpio_reset_pin(GPIO_NUM_4);
-    gpio_set_direction(GPIO_NUM_4, GPIO_MODE_OUTPUT);
-    gpio_set_level(GPIO_NUM_4, 1);  
+    // gpio_pad_select_gpio(GPIO_NUM_4);
+    // gpio_reset_pin(GPIO_NUM_4);
+    // gpio_set_direction(GPIO_NUM_4, GPIO_MODE_OUTPUT);
+    // gpio_set_level(GPIO_NUM_4, 1);  
+
+    gpio_init();
+    buzzer_init();
 
     /* Setup the inertial sensor */
     if (inertial_init() == false) {
@@ -155,28 +286,51 @@ extern "C" int app_main()
 
     state = IMU_SAMPLING;
     start_imu_sampling();
+    create_timer_alert();
     last_inference_ts = ei_read_timer_ms();
 
-    int i = 0;
     while(true)
     {
         if (state != IMU_DATA_READY) 
             ei_sleep(1);
         else if (ei_read_timer_ms() < (last_inference_ts + INFERENCE_SAMPLING_TIME))
             ei_sleep(1);
-        else {
-            int actual_inference_sampling_time = ei_read_timer_ms() - last_inference_ts;
-            last_inference_ts = ei_read_timer_ms();
+        else if (seizure_detected == false){
+            if (state == IMU_DATA_READY)
+            {
+                int actual_inference_sampling_time = ei_read_timer_ms() - last_inference_ts;
+                last_inference_ts = ei_read_timer_ms();
 
-            int tic = ei_read_timer_ms();
-            ei_run_impulse();
-            int toc = ei_read_timer_ms();
-            
-            int inference_time = toc - tic;
-            // ei_printf("Sampling time: %d ms\n", actual_inference_sampling_time);
-            // ei_printf("Inference time: %d ms\n\n", inference_time);
-            // i++;
-        }        
+                int tic = ei_read_timer_ms();
+                ei_run_impulse();
+                int toc = ei_read_timer_ms();
+                
+                int inference_time = toc - tic;
+                ei_printf("Sampling time: %d ms\n", actual_inference_sampling_time);
+                ei_printf("Inference time: %d ms\n\n", inference_time);
+            }
+        }  
+
+        if (gpio_get_level(BUTTON_PIN) == 0 && (seizure_detected == true || seizure_validated == true))
+        {
+            gpio_set_level(VIBRATOR_PIN, 0);
+            buzzer_stop();
+
+            seizure_detected = false;
+            seizure_detected_state = false;
+            seizure_validated = false;
+            seizure_validated_state = false;
+            seizure_validation_counter = 0;
+            state = IMU_SAMPLING;
+            samples_wr_index = 0;
+            last_samples_wr_index = 0;
+        }
+
+        if (send_alert_wifi == true)
+        {
+            send_alert_wifi = false;
+            printf("Envio Alerta!\n");
+        }
     }
 
     stop_imu_sampling();
